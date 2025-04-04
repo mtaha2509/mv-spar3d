@@ -977,10 +977,10 @@ class SPAR3D(BaseModule):
             c2w_cond = view_params.get(view_name, default_cond_c2w(self.cfg.default_distance))
             c2w_cond_list.append(c2w_cond)
         
-        # Stack the tensors
-        rgb_cond = torch.stack(rgb_cond_list, 0)
-        mask_cond = torch.stack(mask_cond_list, 0)
-        c2w_cond = torch.stack(c2w_cond_list, 0).view(batch_size, -1, 4, 4)
+        # Stack the tensors and ensure they're on the correct device
+        rgb_cond = torch.stack(rgb_cond_list, 0).to(self.device)
+        mask_cond = torch.stack(mask_cond_list, 0).to(self.device)
+        c2w_cond = torch.stack(c2w_cond_list, 0).view(batch_size, -1, 4, 4).to(self.device)
         
         # Create intrinsic parameters
         intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_rad(
@@ -989,7 +989,7 @@ class SPAR3D(BaseModule):
             self.cfg.cond_image_size,
         )
         
-        # Prepare batch
+        # Prepare batch with all tensors on the correct device
         batch = {
             "rgb_cond": rgb_cond,
             "mask_cond": mask_cond,
