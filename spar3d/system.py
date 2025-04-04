@@ -952,64 +952,79 @@ class SPAR3D(BaseModule):
         Returns:
             Tuple of (mesh, global dictionary)
         """
-        # Get embeddings for each view
-        embeddings = {}
+        # Process each view and get embeddings
+        batch_size = 1
+        rgb_cond_list = []
+        mask_cond_list = []
+        c2w_cond_list = []
+        
+        # Get camera parameters for each view
+        view_params = {
+            "front": default_cond_c2w(self.cfg.default_distance),
+            "back": default_cond_c2w(self.cfg.default_distance, flip=True),
+            "left": default_cond_c2w(self.cfg.default_distance, rotate=90),
+            "right": default_cond_c2w(self.cfg.default_distance, rotate=-90),
+        }
+        
+        # Process each view
         for view_name, image in images.items():
-            # Convert image to tensor and move to device
-            image_tensor = self.image_to_tensor(image).to(self.device)
+            # Prepare image
+            mask_cond, rgb_cond = self.prepare_image(image)
+            rgb_cond_list.append(rgb_cond)
+            mask_cond_list.append(mask_cond)
             
-            # Get camera embedding for this view
-            camera_embed = self.get_camera_embedding(view_name).to(self.device)
-            
-            # Get image embedding
-            image_embed = self.image_encoder(image_tensor)
-            
-            # Store embeddings
-            embeddings[view_name] = {
-                "image_embed": image_embed,
-                "camera_embed": camera_embed
-            }
+            # Get camera parameters for this view
+            c2w_cond = view_params.get(view_name, default_cond_c2w(self.cfg.default_distance))
+            c2w_cond_list.append(c2w_cond)
         
-        # Weighted average of embeddings
-        weights = {
-            "front": 0.4,
-            "back": 0.3,
-            "left": 0.15,
-            "right": 0.15
-        }
+        # Stack the tensors
+        rgb_cond = torch.stack(rgb_cond_list, 0)
+        mask_cond = torch.stack(mask_cond_list, 0)
+        c2w_cond = torch.stack(c2w_cond_list, 0).view(batch_size, -1, 4, 4)
         
-        # Initialize combined embeddings
-        combined_image_embed = None
-        combined_camera_embed = None
-        
-        # Weighted average
-        for view_name, view_embeddings in embeddings.items():
-            weight = weights.get(view_name, 0.25)  # Default weight if view not in weights
-            
-            if combined_image_embed is None:
-                combined_image_embed = view_embeddings["image_embed"] * weight
-                combined_camera_embed = view_embeddings["camera_embed"] * weight
-            else:
-                combined_image_embed += view_embeddings["image_embed"] * weight
-                combined_camera_embed += view_embeddings["camera_embed"] * weight
-        
-        # Create batch dictionary for mesh generation
-        batch = {
-            "image_embeds": combined_image_embed.unsqueeze(0),  # Add batch dimension
-            "camera_embeds": combined_camera_embed.unsqueeze(0),  # Add batch dimension
-            "num_views": torch.tensor([1], device=self.device)  # Single combined view
-        }
-        
-        # Generate mesh using combined embeddings
-        meshes, global_dict = self.generate_mesh(
-            batch,
-            bake_resolution=bake_resolution,
-            remesh=remesh,
-            vertex_count=vertex_count,
-            return_points=return_points
+        # Create intrinsic parameters
+        intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_rad(
+            self.cfg.default_fovy_rad,
+            self.cfg.cond_image_size,
+            self.cfg.cond_image_size,
         )
         
-        return meshes[0], global_dict  # Return first mesh since we combined views
+        # Prepare batch
+        batch = {
+            "rgb_cond": rgb_cond,
+            "mask_cond": mask_cond,
+            "c2w_cond": c2w_cond,
+            "intrinsic_cond": intrinsic.to(self.device)
+                .view(1, 1, 3, 3)
+                .repeat(batch_size, 1, 1, 1),
+            "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device)
+                .view(1, 1, 3, 3)
+                .repeat(batch_size, 1, 1, 1),
+        }
+        
+        # Generate mesh using the existing pipeline
+        meshes, global_dict = self.generate_mesh(
+            batch,
+            bake_resolution,
+            None,  # No point cloud provided
+            remesh,
+            vertex_count,
+            False,  # No illumination estimation
+        )
+        
+        # Return the first mesh (we only have one batch)
+        mesh = meshes[0]
+        
+        # Add point clouds to global dict if requested
+        if return_points:
+            point_clouds = []
+            xyz = batch["pc_cond"][0, :, :3].cpu().numpy()
+            color_rgb = (batch["pc_cond"][0, :, 3:6] * 255).cpu().numpy().astype(np.uint8)
+            pc_trimesh = trimesh.PointCloud(vertices=xyz, colors=color_rgb)
+            point_clouds.append(pc_trimesh)
+            global_dict["point_clouds"] = point_clouds
+        
+        return mesh, global_dict
 
     def _get_image_embedding(self, image: Image.Image) -> torch.Tensor:
         """Get embedding from a single image."""
