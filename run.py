@@ -1,6 +1,7 @@
 import argparse
 import os
 from contextlib import nullcontext
+from typing import Dict, List, Optional
 
 import torch
 from PIL import Image
@@ -19,11 +20,51 @@ def check_positive(value):
     return ivalue
 
 
+def process_multi_view_images(image_paths: Dict[str, str], bg_remover: Remover, foreground_ratio: float) -> Dict[str, Image.Image]:
+    """Process multiple views of the same object.
+    
+    Args:
+        image_paths: Dictionary mapping view names to image paths
+        bg_remover: Background remover instance
+        foreground_ratio: Ratio for foreground cropping
+        
+    Returns:
+        Dictionary mapping view names to processed images
+    """
+    processed_images = {}
+    for view_name, image_path in image_paths.items():
+        image = remove_background(Image.open(image_path).convert("RGBA"), bg_remover)
+        image = foreground_crop(image, foreground_ratio)
+        processed_images[view_name] = image
+    return processed_images
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "image", type=str, nargs="+", help="Path to input image(s) or folder."
+    
+    # Create a mutually exclusive group for input methods
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "image", type=str, nargs="*", help="Path to input image(s) or folder (legacy mode)."
     )
+    input_group.add_argument(
+        "--single-image", type=str, help="Path to single input image (legacy mode)."
+    )
+    
+    # Multi-view arguments
+    parser.add_argument(
+        "--front", type=str, help="Path to front view image"
+    )
+    parser.add_argument(
+        "--back", type=str, help="Path to back view image"
+    )
+    parser.add_argument(
+        "--left", type=str, help="Path to left view image"
+    )
+    parser.add_argument(
+        "--right", type=str, help="Path to right view image"
+    )
+    
     parser.add_argument(
         "--device",
         default=get_device(),
@@ -117,32 +158,8 @@ if __name__ == "__main__":
     model.eval()
 
     bg_remover = Remover(device=device)
-    images = []
-    idx = 0
-    for image_path in args.image:
-
-        def handle_image(image_path, idx):
-            image = remove_background(
-                Image.open(image_path).convert("RGBA"), bg_remover
-            )
-            image = foreground_crop(image, args.foreground_ratio)
-            os.makedirs(os.path.join(output_dir, str(idx)), exist_ok=True)
-            image.save(os.path.join(output_dir, str(idx), "input.png"))
-            images.append(image)
-
-        if os.path.isdir(image_path):
-            image_paths = [
-                os.path.join(image_path, f)
-                for f in os.listdir(image_path)
-                if f.endswith((".png", ".jpg", ".jpeg"))
-            ]
-            for image_path in image_paths:
-                handle_image(image_path, idx)
-                idx += 1
-        else:
-            handle_image(image_path, idx)
-            idx += 1
-
+    
+    # Calculate vertex count for remeshing
     vertex_count = (
         -1
         if args.reduction_count_type == "keep"
@@ -152,39 +169,111 @@ if __name__ == "__main__":
             else args.target_count // 2
         )
     )
-
-    for i in tqdm(range(0, len(images), args.batch_size)):
-        image = images[i : i + args.batch_size]
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+    
+    # Check if we're using multi-view mode
+    is_multi_view = any([args.front, args.back, args.left, args.right])
+    
+    if is_multi_view:
+        # Multi-view mode
+        image_paths = {}
+        if args.front: image_paths["front"] = args.front
+        if args.back: image_paths["back"] = args.back
+        if args.left: image_paths["left"] = args.left
+        if args.right: image_paths["right"] = args.right
+        
+        if not image_paths:
+            raise ValueError("No input images provided. Use --single-image or specify views with --front, --back, etc.")
+            
+        processed_images = process_multi_view_images(image_paths, bg_remover, args.foreground_ratio)
+        
+        # Save processed images
+        os.makedirs(output_dir, exist_ok=True)
+        for view_name, image in processed_images.items():
+            image.save(os.path.join(output_dir, f"{view_name}.png"))
+            
         with torch.no_grad():
             with (
                 torch.autocast(device_type=device, dtype=torch.bfloat16)
                 if "cuda" in device
                 else nullcontext()
             ):
-                mesh, glob_dict = model.run_image(
-                    image,
+                mesh, glob_dict = model.run_multi_view(
+                    processed_images,
                     bake_resolution=args.texture_resolution,
                     remesh=args.remesh_option,
                     vertex_count=vertex_count,
                     return_points=True,
                 )
-        if torch.cuda.is_available():
-            print("Peak Memory:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
-        elif torch.backends.mps.is_available():
-            print(
-                "Peak Memory:", torch.mps.driver_allocated_memory() / 1024 / 1024, "MB"
-            )
-
-        if len(image) == 1:
-            out_mesh_path = os.path.join(output_dir, str(i), "mesh.glb")
-            mesh.export(out_mesh_path, include_normals=True)
-            out_points_path = os.path.join(output_dir, str(i), "points.ply")
-            glob_dict["point_clouds"][0].export(out_points_path)
+        
+        out_mesh_path = os.path.join(output_dir, "mesh.glb")
+        mesh.export(out_mesh_path, include_normals=True)
+        out_points_path = os.path.join(output_dir, "points.ply")
+        glob_dict["point_clouds"][0].export(out_points_path)
+        
+    else:
+        # Legacy single image mode
+        images = []
+        idx = 0
+        
+        # Handle single image or multiple images
+        if args.single_image:
+            image_paths = [args.single_image]
         else:
-            for j in range(len(mesh)):
-                out_mesh_path = os.path.join(output_dir, str(i + j), "mesh.glb")
-                mesh[j].export(out_mesh_path, include_normals=True)
-                out_points_path = os.path.join(output_dir, str(i + j), "points.ply")
-                glob_dict["point_clouds"][j].export(out_points_path)
+            image_paths = args.image
+            
+        for image_path in image_paths:
+            def handle_image(image_path, idx):
+                image = remove_background(Image.open(image_path).convert("RGBA"), bg_remover)
+                image = foreground_crop(image, args.foreground_ratio)
+                os.makedirs(os.path.join(output_dir, str(idx)), exist_ok=True)
+                image.save(os.path.join(output_dir, str(idx), "input.png"))
+                images.append(image)
+
+            if os.path.isdir(image_path):
+                image_paths_in_dir = [
+                    os.path.join(image_path, f)
+                    for f in os.listdir(image_path)
+                    if f.endswith((".png", ".jpg", ".jpeg"))
+                ]
+                for image_path in image_paths_in_dir:
+                    handle_image(image_path, idx)
+                    idx += 1
+            else:
+                handle_image(image_path, idx)
+                idx += 1
+
+        for i in tqdm(range(0, len(images), args.batch_size)):
+            image = images[i : i + args.batch_size]
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            with torch.no_grad():
+                with (
+                    torch.autocast(device_type=device, dtype=torch.bfloat16)
+                    if "cuda" in device
+                    else nullcontext()
+                ):
+                    mesh, glob_dict = model.run_image(
+                        image,
+                        bake_resolution=args.texture_resolution,
+                        remesh=args.remesh_option,
+                        vertex_count=vertex_count,
+                        return_points=True,
+                    )
+            if torch.cuda.is_available():
+                print("Peak Memory:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
+            elif torch.backends.mps.is_available():
+                print(
+                    "Peak Memory:", torch.mps.driver_allocated_memory() / 1024 / 1024, "MB"
+                )
+
+            if len(image) == 1:
+                out_mesh_path = os.path.join(output_dir, str(i), "mesh.glb")
+                mesh.export(out_mesh_path, include_normals=True)
+                out_points_path = os.path.join(output_dir, str(i), "points.ply")
+                glob_dict["point_clouds"][0].export(out_points_path)
+            else:
+                for j in range(len(mesh)):
+                    out_mesh_path = os.path.join(output_dir, str(i + j), "mesh.glb")
+                    mesh[j].export(out_mesh_path, include_normals=True)
+                    out_points_path = os.path.join(output_dir, str(i + j), "points.ply")
+                    glob_dict["point_clouds"][j].export(out_points_path)

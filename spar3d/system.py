@@ -52,6 +52,16 @@ except ImportError:
     raise ImportError("texture_baker not found")
 
 
+@dataclass
+class MultiViewConfig:
+    """Configuration for multi-view fusion."""
+    view_weights: Dict[str, float] = field(default_factory=lambda: {
+        "front": 0.4,
+        "back": 0.3,
+        "left": 0.15,
+        "right": 0.15
+    })
+
 class SPAR3D(BaseModule):
     @dataclass
     class Config(BaseModule.Config):
@@ -116,6 +126,8 @@ class SPAR3D(BaseModule):
         s_churn: float = 3.0
 
         low_vram_mode: bool = False
+
+        multi_view: MultiViewConfig = field(default_factory=MultiViewConfig)
 
     cfg: Config
 
@@ -919,3 +931,180 @@ class SPAR3D(BaseModule):
                     rets.append(tmesh)
 
         return rets, global_dict
+
+    def run_multi_view(
+        self,
+        images: Dict[str, Image.Image],
+        bake_resolution: int = 1024,
+        remesh: Literal["none", "triangle", "quad"] = "none",
+        vertex_count: int = -1,
+        return_points: bool = False,
+    ) -> Tuple[Mesh, Dict[str, Any]]:
+        """Run SPAR3D on multiple views of the same object.
+        
+        Args:
+            images: Dictionary mapping view names to processed images
+            bake_resolution: Resolution of the texture atlas
+            remesh: Remeshing option
+            vertex_count: Target vertex count for remeshing
+            return_points: Whether to return point clouds
+            
+        Returns:
+            Tuple of (mesh, global dictionary)
+        """
+        # Process each view and get embeddings
+        batch_size = 1
+        rgb_cond_list = []
+        mask_cond_list = []
+        c2w_cond_list = []
+        
+        # Get camera parameters for each view
+        view_params = {
+            "front": default_cond_c2w(self.cfg.default_distance),
+            "back": default_cond_c2w(self.cfg.default_distance, flip=True),
+            "left": default_cond_c2w(self.cfg.default_distance, rotate=90),
+            "right": default_cond_c2w(self.cfg.default_distance, rotate=-90),
+        }
+        
+        # Process each view
+        for view_name, image in images.items():
+            # Prepare image
+            mask_cond, rgb_cond = self.prepare_image(image)
+            rgb_cond_list.append(rgb_cond)
+            mask_cond_list.append(mask_cond)
+            
+            # Get camera parameters for this view
+            c2w_cond = view_params.get(view_name, default_cond_c2w(self.cfg.default_distance))
+            c2w_cond_list.append(c2w_cond)
+        
+        # Stack the tensors
+        rgb_cond = torch.stack(rgb_cond_list, 0)
+        mask_cond = torch.stack(mask_cond_list, 0)
+        c2w_cond = torch.stack(c2w_cond_list, 0).view(batch_size, -1, 4, 4)
+        
+        # Create intrinsic parameters
+        intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_rad(
+            self.cfg.default_fovy_rad,
+            self.cfg.cond_image_size,
+            self.cfg.cond_image_size,
+        )
+        
+        # Prepare batch
+        batch = {
+            "rgb_cond": rgb_cond,
+            "mask_cond": mask_cond,
+            "c2w_cond": c2w_cond,
+            "intrinsic_cond": intrinsic.to(self.device)
+                .view(1, 1, 3, 3)
+                .repeat(batch_size, 1, 1, 1),
+            "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device)
+                .view(1, 1, 3, 3)
+                .repeat(batch_size, 1, 1, 1),
+        }
+        
+        # Generate mesh using the existing pipeline
+        meshes, global_dict = self.generate_mesh(
+            batch,
+            bake_resolution,
+            None,  # No point cloud provided
+            remesh,
+            vertex_count,
+            False,  # No illumination estimation
+        )
+        
+        # Return the first mesh (we only have one batch)
+        mesh = meshes[0]
+        
+        # Add point clouds to global dict if requested
+        if return_points:
+            point_clouds = []
+            xyz = batch["pc_cond"][0, :, :3].cpu().numpy()
+            color_rgb = (batch["pc_cond"][0, :, 3:6] * 255).cpu().numpy().astype(np.uint8)
+            pc_trimesh = trimesh.PointCloud(vertices=xyz, colors=color_rgb)
+            point_clouds.append(pc_trimesh)
+            global_dict["point_clouds"] = point_clouds
+        
+        return mesh, global_dict
+
+    def _get_image_embedding(self, image: Image.Image) -> torch.Tensor:
+        """Get embedding from a single image."""
+        # Process image through the image tokenizer
+        image_tokens = self.image_tokenizer(image)
+        
+        # Get camera parameters (assuming front view for now)
+        camera_params = default_cond_c2w()
+        
+        # Get embeddings from backbone
+        embeddings = self.backbone(image_tokens, camera_params)
+        
+        return embeddings
+
+    def _fuse_embeddings(self, view_embeddings: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Fuse embeddings from multiple views using weighted average."""
+        weights = self.cfg.multi_view.view_weights
+        
+        # Initialize unified embedding
+        unified_embedding = torch.zeros_like(next(iter(view_embeddings.values())))
+        
+        # Apply weighted average
+        for view_name, embedding in view_embeddings.items():
+            if view_name in weights:
+                weight = weights[view_name]
+                unified_embedding += weight * embedding
+        
+        return unified_embedding
+
+    def _generate_point_cloud(self, embedding: torch.Tensor) -> torch.Tensor:
+        """Generate point cloud from unified embedding."""
+        # Use the point cloud sampler to generate points
+        point_cloud = self.sampler(embedding)
+        return point_cloud
+
+    def _generate_mesh(
+        self,
+        point_cloud: torch.Tensor,
+        remesh: str,
+        vertex_count: int
+    ) -> Mesh:
+        """Generate mesh from point cloud."""
+        # Use marching tetrahedra to generate mesh
+        mesh = self.isosurface_helper(point_cloud[:, :, 0], point_cloud[:, :, 1:4])
+        
+        # Apply remeshing if requested
+        if remesh != "none":
+            mesh = mesh.triangle_remesh(triangle_vertex_count=vertex_count)
+            
+        return mesh
+
+    def _bake_textures(
+        self,
+        mesh: Mesh,
+        images: Dict[str, Image.Image],
+        resolution: int
+    ) -> None:
+        """Bake textures using all available views."""
+        # Initialize texture baker
+        baker = TextureBaker(resolution=resolution)
+        
+        # Bake textures from each view
+        for view_name, image in images.items():
+            # Get camera parameters for this view
+            camera_params = self._get_camera_params_for_view(view_name)
+            
+            # Bake texture from this view
+            baker.bake(mesh, image, camera_params)
+            
+        # Apply final texture to mesh
+        mesh.texture = baker.get_final_texture()
+
+    def _get_camera_params_for_view(self, view_name: str) -> torch.Tensor:
+        """Get camera parameters for a specific view."""
+        # Define camera parameters for each view
+        view_params = {
+            "front": default_cond_c2w(),  # Default front view
+            "back": default_cond_c2w(flip=True),  # Flipped for back view
+            "left": default_cond_c2w(rotate=90),  # Rotated 90 degrees
+            "right": default_cond_c2w(rotate=-90),  # Rotated -90 degrees
+        }
+        
+        return view_params.get(view_name, default_cond_c2w())

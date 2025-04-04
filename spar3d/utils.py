@@ -40,8 +40,19 @@ def create_intrinsic_from_fov_deg(fov_deg: float, cond_height: int, cond_width: 
     return create_intrinsic_from_fov_rad(np.deg2rad(fov_deg), cond_height, cond_width)
 
 
-def default_cond_c2w(distance: float):
-    c2w_cond = torch.as_tensor(
+def default_cond_c2w(distance: float = 2.2, flip: bool = False, rotate: float = 0.0) -> torch.Tensor:
+    """Get default camera-to-world transformation matrix with optional flip and rotation.
+    
+    Args:
+        distance: Distance from camera to origin
+        flip: Whether to flip the camera (for back view)
+        rotate: Rotation angle in degrees
+        
+    Returns:
+        Camera-to-world transformation matrix
+    """
+    # Default camera parameters (front view)
+    c2w = torch.as_tensor(
         [
             [0, 0, 1, distance],
             [1, 0, 0, 0],
@@ -49,7 +60,32 @@ def default_cond_c2w(distance: float):
             [0, 0, 0, 1],
         ]
     ).float()
-    return c2w_cond
+    
+    # Apply flip if needed (for back view)
+    if flip:
+        # Flip the camera by negating the first row (x-axis)
+        c2w[0, 0] = -c2w[0, 0]
+        c2w[0, 2] = -c2w[0, 2]
+        
+    # Apply rotation if needed
+    if rotate != 0:
+        # Convert degrees to radians
+        theta = torch.tensor(rotate * np.pi / 180.0)
+        
+        # Create rotation matrix around y-axis
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+        
+        rotation = torch.eye(4)
+        rotation[0, 0] = cos_theta
+        rotation[0, 2] = sin_theta
+        rotation[2, 0] = -sin_theta
+        rotation[2, 2] = cos_theta
+        
+        # Apply rotation
+        c2w = rotation @ c2w
+    
+    return c2w
 
 
 def normalize_pc_bbox(pc, scale=1.0):
