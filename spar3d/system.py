@@ -980,7 +980,13 @@ class SPAR3D(BaseModule):
         # Stack the tensors and ensure they're on the correct device
         rgb_cond = torch.stack(rgb_cond_list, 0).to(self.device)
         mask_cond = torch.stack(mask_cond_list, 0).to(self.device)
-        c2w_cond = torch.stack(c2w_cond_list, 0).view(batch_size, -1, 4, 4).to(self.device)
+        c2w_cond = torch.stack(c2w_cond_list, 0).to(self.device)
+        
+        # Reshape tensors to match expected dimensions
+        n_views = len(images)
+        rgb_cond = rgb_cond.view(batch_size, n_views, self.cfg.cond_image_size, self.cfg.cond_image_size, 3)
+        mask_cond = mask_cond.view(batch_size, n_views, self.cfg.cond_image_size, self.cfg.cond_image_size, 1)
+        c2w_cond = c2w_cond.view(batch_size, n_views, 4, 4)
         
         # Create intrinsic parameters
         intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_rad(
@@ -996,10 +1002,10 @@ class SPAR3D(BaseModule):
             "c2w_cond": c2w_cond,
             "intrinsic_cond": intrinsic.to(self.device)
                 .view(1, 1, 3, 3)
-                .repeat(batch_size, 1, 1, 1),
+                .repeat(batch_size, n_views, 1, 1),
             "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device)
                 .view(1, 1, 3, 3)
-                .repeat(batch_size, 1, 1, 1),
+                .repeat(batch_size, n_views, 1, 1),
         }
         
         # Generate mesh using the existing pipeline
