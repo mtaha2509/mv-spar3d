@@ -42,12 +42,11 @@ def process_multi_view_images(image_paths: Dict[str, str], bg_remover: Remover, 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
-    # Create a mutually exclusive group for input methods
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument(
-        "image", type=str, nargs="*", help="Path to input image(s) or folder (legacy mode)."
+    # Legacy mode arguments
+    parser.add_argument(
+        "--image", type=str, nargs="*", help="Path to input image(s) or folder (legacy mode)."
     )
-    input_group.add_argument(
+    parser.add_argument(
         "--single-image", type=str, help="Path to single input image (legacy mode)."
     )
     
@@ -218,8 +217,10 @@ if __name__ == "__main__":
         # Handle single image or multiple images
         if args.single_image:
             image_paths = [args.single_image]
-        else:
+        elif args.image:
             image_paths = args.image
+        else:
+            raise ValueError("No input images provided. Use --single-image, --image, or specify views with --front, --back, etc.")
             
         for image_path in image_paths:
             def handle_image(image_path, idx):
